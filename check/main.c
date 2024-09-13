@@ -68,6 +68,7 @@
 #include "check/mode-original.h"
 #include "check/mode-lowmem.h"
 #include "check/qgroup-verify.h"
+#include "common/block-group.c"
 
 /* Global context variables */
 struct btrfs_fs_info *gfs_info;
@@ -10538,6 +10539,9 @@ static int cmd_check(const struct cmd_struct *cmd, int argc, char **argv)
 	ret = validate_free_space_cache(root, &g_task_ctx);
 	task_stop(g_task_ctx.info);
 	err |= !!ret;
+
+	fprintf(stderr, "[3.5/7] checking block group overlap\n");
+	check_block_group_overlap(root);
 
 	/*
 	 * We used to have to have these hole extents in between our real
