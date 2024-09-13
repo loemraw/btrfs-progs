@@ -3536,6 +3536,9 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
 		return ret;
 	}
 
+	/* delete free space items associated with this block group */
+	remove_block_group_free_space(trans, block_group);
+
 	/* Now release the block_group_cache */
 	ret = free_block_group_cache(trans, fs_info, bytenr, len);
 	btrfs_unpin_extent(fs_info, bytenr, len);
