@@ -558,7 +558,7 @@ out:
 }
 
 static int corrupt_key(struct btrfs_root *root, struct btrfs_key *key,
-		       char *field)
+		       char *field, int value_set, u64 value)
 {
 	enum btrfs_key_field corrupt_field = convert_key_field(field);
 	struct btrfs_path *path;
@@ -591,13 +591,13 @@ static int corrupt_key(struct btrfs_root *root, struct btrfs_key *key,
 
 	switch (corrupt_field) {
 	case BTRFS_KEY_OBJECTID:
-		key->objectid = generate_u64(key->objectid);
+		key->objectid = value_set ? value : generate_u64(key->objectid);
 		break;
 	case BTRFS_KEY_TYPE:
-		key->type = generate_u8(key->type);
+		key->type = value_set ? value : generate_u8(key->type);
 		break;
 	case BTRFS_KEY_OFFSET:
-		key->offset = generate_u64(key->objectid);
+		key->offset = value_set ? value : generate_u64(key->objectid);
 		break;
 	default:
 		error("invalid field %s, %d", field, corrupt_field);
@@ -1327,6 +1327,7 @@ int main(int argc, char **argv)
 	u64 csum_bytenr = 0;
 	u64 block_group = 0;
 	char field[FIELD_BUF_LEN];
+	int set_value = 0;
 	u64 bogus_value = (u64)-1;
 	u64 bogus_offset = (u64)-1;
 
@@ -1432,6 +1433,7 @@ int main(int argc, char **argv)
 				block_group = arg_strtou64(optarg);
 				break;
 			case GETOPT_VAL_VALUE:
+				set_value = 1;
 				bogus_value = arg_strtou64(optarg);
 				break;
 			case GETOPT_VAL_OFFSET:
@@ -1583,8 +1585,7 @@ int main(int argc, char **argv)
 	if (should_corrupt_key) {
 		if (*field == 0)
 			usage(&corrupt_block_cmd, 1);
-
-		ret = corrupt_key(target_root, &key, field);
+		ret = corrupt_key(target_root, &key, field, set_value, bogus_value);
 		goto out_close;
 	}
 	if (block_group) {
