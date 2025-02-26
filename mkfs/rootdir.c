@@ -1924,7 +1924,7 @@ err:
 }
 
 int btrfs_mkfs_shrink_fs(struct btrfs_fs_info *fs_info, u64 *new_size_ret,
-			 bool shrink_file_size)
+			 bool shrink_file_size, u64 slack_size)
 {
 	u64 new_size;
 	struct btrfs_device *device;
@@ -1947,6 +1947,8 @@ int btrfs_mkfs_shrink_fs(struct btrfs_fs_info *fs_info, u64 *new_size_ret,
 		error("failed to get minimal device size: %d (%m)", ret);
 		return ret;
 	}
+
+	new_size += slack_size;
 
 	if (!IS_ALIGNED(new_size, fs_info->sectorsize)) {
 		error("shrunk filesystem size %llu not aligned to %u",

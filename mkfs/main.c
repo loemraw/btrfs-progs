@@ -460,7 +460,7 @@ static const char * const mkfs_usage[] = {
 	OPTLINE("", "- ro - create the subvolume as read-only"),
 	OPTLINE("", "- default - the SUBDIR will be a subvolume and also set as default (can be specified only once)"),
 	OPTLINE("", "- default-ro - like 'default' and is created as read-only subvolume (can be specified only once)"),
-	OPTLINE("--shrink", "(with --rootdir) shrink the filled filesystem to minimal size"),
+	OPTLINE("--shrink [SIZE]", "(with --rootdir) shrink the filled filesystem to minimal size with optional slack (default 0)"),
 	OPTLINE("-K|--nodiscard", "do not perform whole device TRIM"),
 	OPTLINE("-f|--force", "force overwrite of existing filesystem"),
 	"",
@@ -1176,6 +1176,7 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 	u64 source_dir_size = 0;
 	u64 min_dev_size;
 	u64 shrink_size;
+	u64 shrink_slack_size;
 	int device_count = 0;
 	int saved_optind;
 	pthread_t *t_prepare = NULL;
@@ -1246,7 +1247,7 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 				GETOPT_VAL_DEVICE_UUID },
 			{ "quiet", 0, NULL, 'q' },
 			{ "verbose", 0, NULL, 'v' },
-			{ "shrink", no_argument, NULL, GETOPT_VAL_SHRINK },
+			{ "shrink", optional_argument, NULL, GETOPT_VAL_SHRINK },
 			{ "compress", required_argument, NULL,
 				GETOPT_VAL_COMPRESS },
 #if EXPERIMENTAL
@@ -1381,6 +1382,7 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 				strncpy_null(dev_uuid, optarg, BTRFS_UUID_UNPARSED_SIZE);
 				break;
 			case GETOPT_VAL_SHRINK:
+				shrink_slack_size = optarg == NULL ? 0 : arg_strtou64_with_suffix(optarg);
 				shrink_rootdir = true;
 				break;
 			case GETOPT_VAL_CHECKSUM:
@@ -2107,14 +2109,23 @@ raid_groups:
 		}
 
 		if (shrink_rootdir) {
-			pr_verbose(LOG_DEFAULT, "  Shrink:           yes\n");
+			pr_verbose(LOG_DEFAULT, "  Shrink:           yes  (slack: %s)\n", pretty_size(shrink_slack_size));
 			ret = btrfs_mkfs_shrink_fs(fs_info, &shrink_size,
-						   shrink_rootdir);
+						   shrink_rootdir, shrink_slack_size);
+
+
 			if (ret < 0) {
 				errno = -ret;
 				error("error while shrinking filesystem: %m");
 				goto out;
 			}
+
+			if (shrink_size > byte_count) {
+				errno = EFBIG;
+				error("filesystem larger than underlying device: %m");
+				goto out;
+			}
+
 		} else {
 			pr_verbose(LOG_DEFAULT, "  Shrink:           no\n");
 		}
