@@ -38,10 +38,12 @@
 #include "kernel-lib/sizes.h"
 #include "kernel-lib/list_sort.h"
 #include "kernel-lib/overflow.h"
+#include "kernel-shared/accessors.h"
 #include "kernel-shared/ctree.h"
 #include "kernel-shared/compression.h"
 #include "kernel-shared/volumes.h"
 #include "kernel-shared/disk-io.h"
+#include "kernel-shared/transaction.h"
 #include "common/defs.h"
 #include "common/internal.h"
 #include "common/messages.h"
@@ -1287,8 +1289,230 @@ static const char * const cmd_filesystem_resize_usage[] = {
 	"[kK] means KiB, which denotes 1KiB = 1024B, 1MiB = 1024KiB, etc.",
 	"",
 	OPTLINE("--enqueue", "wait if there's another exclusive operation running, otherwise continue"),
+	OPTLINE("--offline", "resize an offline filesystem, only increases are allowed"),
 	NULL
 };
+
+static int check_offline_resize_args(const char *path, const char *amount,
+				     const struct btrfs_fs_info *fs_info,
+				     struct btrfs_device **device_ret,
+				     u64 *new_size_ret)
+{
+	int ret = 0;
+	char amount_dup[BTRFS_VOL_NAME_MAX];
+	struct btrfs_device *device = NULL;
+	struct btrfs_device *mindev = NULL;
+	bool dev_found = false;
+	u64 devid = 1;
+	u64 mindevid = (u64)-1;
+	char *devstr = NULL;
+	struct stat stat_buf;
+	char *sizestr = NULL;
+	u64 new_size = 0, old_size = 0, diff = 0;
+	int mod = 0;
+
+	if (check_mounted(path)) {
+		error("%s must not be mounted to use --offline", path);
+		return 1;
+	}
+
+	if (!fs_info->fs_devices->num_devices) {
+		error("no devices found");
+		return 1;
+	}
+
+	ret = snprintf(amount_dup, BTRFS_VOL_NAME_MAX, "%s", amount);
+	if (strlen(amount) != ret) {
+		error("newsize argument is too long");
+		return 1;
+	}
+
+	if (strcmp(amount, "cancel") == 0) {
+		error("cannot cancel offline resize since the operation is synchronous");
+		return 1;
+	}
+
+	/* Parse device id. */
+	sizestr = amount_dup;
+	devstr = strchr(sizestr, ':');
+	if (devstr) {
+		sizestr = devstr + 1;
+		*devstr = 0;
+		devstr = amount_dup;
+
+		errno = 0;
+		devid = strtoull(devstr, NULL, 10);
+
+		if (errno) {
+			error("failed to parse devid %s: %m", devstr);
+			return 1;
+		}
+	}
+
+	/* Find device matching device id */
+	list_for_each_entry(device, &fs_info->fs_devices->devices, dev_list) {
+		if (device->devid < mindevid) {
+			mindevid = device->devid;
+			mindev = device;
+		}
+		if (device->devid == devid) {
+			dev_found = true;
+			break;
+		}
+	}
+
+	if (devstr && !dev_found) {
+		/* Devid specified but not found. */
+		error("cannot find devid: %lld", devid);
+		return 1;
+	} else if (!devstr && devid == 1 && !dev_found) {
+		/*
+		 * No device specified, assuming implicit 1 but it does not
+		 * exist. Use minimum device as fallback.
+		 */
+		warning("no devid specified means devid 1 which does not exist, using\n"
+			"\t lowest devid %llu as a fallback",
+			mindevid);
+		devid = mindevid;
+		device = mindev;
+	}
+	if (!device) {
+		error("unable to find device");
+		return 1;
+	}
+	*device_ret = device;
+	old_size = device->total_bytes;
+
+	if (strcmp(sizestr, "max") == 0) {
+		if (path_is_block_device(device->name)) {
+			new_size = device_get_partition_size(device->name);
+		} else if (path_is_reg_file(device->name)) {
+			stat(device->name, &stat_buf);
+			new_size = stat_buf.st_size;
+		}
+
+		if (new_size == 0) {
+			error("unable to get size for device: %s",
+			      device->name);
+			return 1;
+		}
+	} else {
+		if (sizestr[0] == '-') {
+			error("offline resize does not support shrinking");
+			return 1;
+		} else if (sizestr[0] == '+') {
+			mod = 1;
+			sizestr++;
+		}
+		ret = parse_u64_with_suffix(sizestr, &diff);
+		if (ret < 0) {
+			error("failed to parse size %s", sizestr);
+			return 1;
+		}
+
+		/* For target sizes without +/- sign prefix (e.g. 1:150g) */
+		if (mod == 0) {
+			new_size = diff;
+		} else if (mod > 0) {
+			if (diff > ULLONG_MAX - old_size) {
+				error("increasing %s is out of range",
+				      pretty_size_mode(diff, UNITS_DEFAULT));
+				return 1;
+			}
+			new_size = old_size + diff;
+		}
+	}
+	new_size = round_down(new_size, fs_info->sectorsize);
+	if (new_size < old_size) {
+		error("offline resize does not support shrinking");
+		return 1;
+	}
+	*new_size_ret = new_size;
+
+	if (path_is_block_device(device->name) &&
+	    new_size > device_get_partition_size(device->name)) {
+		error("unable to resize '%s': not enough free space",
+		      device->name);
+		return 1;
+	}
+
+	if (new_size < 256 * SZ_1M)
+		warning("the new size %lld (%s) is < 256MiB, this may be rejected by kernel",
+			new_size, pretty_size_mode(new_size, UNITS_DEFAULT));
+
+	pr_verbose(LOG_DEFAULT, "Resize device id %lld from %s to %s\n", devid,
+		   pretty_size_mode(old_size, UNITS_DEFAULT),
+		   pretty_size_mode(new_size, UNITS_DEFAULT));
+	return 0;
+}
+
+static int offline_resize(const char *path, const char *amount)
+{
+	int ret = 0;
+	struct btrfs_root *root;
+	struct btrfs_fs_info *fs_info;
+	struct btrfs_device *device;
+	struct btrfs_super_block *super;
+	struct btrfs_trans_handle *trans;
+	u64 new_size;
+	u64 old_total;
+	u64 diff;
+	char dev_name[BTRFS_VOL_NAME_MAX];
+
+	root = open_ctree(path, 0, OPEN_CTREE_WRITES | OPEN_CTREE_CHUNK_ROOT_ONLY);
+	if (!root) {
+		error("could not open file at %s\n"
+		      "offline resize works on a file containing a btrfs image.",
+		      path);
+		return 1;
+	}
+	fs_info = root->fs_info;
+	super = fs_info->super_copy;
+
+	ret = check_offline_resize_args(path, amount, fs_info, &device,
+					&new_size);
+	if (ret) {
+		ret = 1;
+		goto close;
+	}
+
+	ret = snprintf(dev_name, BTRFS_VOL_NAME_MAX, "%s", device->name);
+	if (strlen(device->name) != ret) {
+		error("device name too long %s", device->name);
+		ret = 1;
+		goto close;
+	}
+	ret = 0;
+
+	trans = btrfs_start_transaction(root, 1);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		errno = -ret;
+		error_msg(ERROR_MSG_START_TRANS, "%m");
+		return ret;
+	}
+	old_total = btrfs_super_total_bytes(super);
+	diff = round_down(new_size - device->total_bytes, fs_info->sectorsize);
+	btrfs_set_super_total_bytes(super, round_down(old_total + diff,
+						      fs_info->sectorsize));
+	device->total_bytes = new_size;
+	ret = btrfs_update_device(trans, device);
+	if (ret) {
+		btrfs_abort_transaction(trans, ret);
+		goto close;
+	}
+	ret |= btrfs_commit_transaction(trans, root);
+close:
+	ret |= close_ctree(root);
+	if (ret)
+		return ret;
+
+	if (path_is_reg_file(dev_name))
+		ret = truncate(dev_name, new_size);
+	if (ret)
+		error("failed to truncate %s", device->name);
+	return ret;
+}
 
 static int check_resize_args(const char *amount, const char *path, u64 *devid_ret)
 {
@@ -1449,6 +1673,7 @@ static int cmd_filesystem_resize(const struct cmd_struct *cmd,
 	u64 devid;
 	int ret;
 	bool enqueue = false;
+	bool offline = false;
 	bool cancel = false;
 
 	/*
@@ -1458,6 +1683,8 @@ static int cmd_filesystem_resize(const struct cmd_struct *cmd,
 	for (optind = 1; optind < argc; optind++) {
 		if (strcmp(argv[optind], "--enqueue") == 0) {
 			enqueue = true;
+		} else if (strcmp(argv[optind], "--offline") == 0) {
+			offline = true;
 		} else if (strcmp(argv[optind], "--") == 0) {
 			/* Separator: options -- non-options */
 		} else if (strncmp(argv[optind], "--", 2) == 0) {
@@ -1472,6 +1699,12 @@ static int cmd_filesystem_resize(const struct cmd_struct *cmd,
 	if (check_argc_exact(argc - optind, 2))
 		return 1;
 
+	if (offline && enqueue) {
+		error("--enqueue is not compatible with --offline\n"
+		      "since offline resizing is synchronous");
+		return 1;
+	}
+
 	amount = argv[optind];
 	path = argv[optind + 1];
 
@@ -1480,6 +1713,9 @@ static int cmd_filesystem_resize(const struct cmd_struct *cmd,
 		error("resize value too long (%s)", amount);
 		return 1;
 	}
+
+	if (offline)
+		return offline_resize(path, amount);
 
 	cancel = (strcmp("cancel", amount) == 0);
 
@@ -1490,7 +1726,8 @@ static int cmd_filesystem_resize(const struct cmd_struct *cmd,
 			error(
 		"resize works on mounted filesystems and accepts only\n"
 		"directories as argument. Passing file containing a btrfs image\n"
-		"would resize the underlying filesystem instead of the image.\n");
+		"would resize the underlying filesystem instead of the image.\n"
+		"To resize a file containing a btrfs image please use the --offline flag.\n");
 		}
 		return 1;
 	}
